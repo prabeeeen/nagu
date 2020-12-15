@@ -1,0 +1,160 @@
+#! /bin/ksh
+#-------------------------------------------------------------------------
+# created by :Praveen Kumar
+# Date :  14-Dec-2020
+#  File :  int_store_vdate_valid_insert.ksh
+#  usage:  it will insert the record into int_store_vdate table from
+#          psm_store_rollout table if the store will meet the rollout date
+#-------------------------------------------------------------------------
+pgmName=`basename $0`
+pgmName=${pgmName##*/}    # remove the path
+pgmExt=${pgmName##*.}     # get the extension
+pgmName=${pgmName%.*}     # get the program name
+pgmPID=$$                 # get the process ID
+exeDate=`date +"%h_%d"`   # get the execution date
+LOGFILE="${LOGDIR}/$exeDate.log"
+ERRORFILE="${ERROR}/err.$pgmName."$exeDate
+ERRINDFILE=err.ind
+USERID=`whoami`
+
+# Initialize number of parallel threads
+parallelThreads=20
+OK=0
+FATAL=1
+
+USAGE="Usage: `basename $0` <connect> \n"
+
+#-------------------------------------------------------------------------
+# Function Name: LOG_ERROR
+# Purpose      : Log the error messages to the error file.
+#-------------------------------------------------------------------------
+function LOG_ERROR
+{
+   errMsg=`echo $1`       # echo message to a single line
+   errFunc=$2
+   retCode=$3
+
+   dtStamp=`date +"%G%m%d%H%M%S"`
+   echo "$pgmName~$dtStamp~$errFunc~$errMsg" >> $ERRORFILE
+   if [[ $retCode -eq ${FATAL} ]]; then
+      LOG_MESSAGE "Aborted in" $errFunc $retCode
+   fi
+   return $retCode
+}
+
+#-------------------------------------------------------------------------
+# Function Name: EXEC_SQL
+# Purpose      : Used for executing the sql statements.
+#-------------------------------------------------------------------------
+
+function EXEC_SQL
+{
+   sqlTxt=$*
+
+   sqlReturn=`echo "set feedback off;
+      set heading off;
+      set term off;
+      set verify off;
+      set serveroutput on size 1000000;
+
+      VARIABLE GV_return_code    NUMBER;
+      VARIABLE GV_script_error   CHAR(255);
+
+      EXEC :GV_return_code  := 0;
+      EXEC :GV_script_error := NULL;
+
+      WHENEVER SQLERROR EXIT ${FATAL}
+      $sqlTxt
+      /
+
+      print :GV_script_error;
+      exit  :GV_return_code;
+      " | sqlplus -s $CONNECT`
+
+   if [[ $? -ne ${OK} ]]; then
+      LOG_ERROR "${sqlReturn}" "EXEC_SQL" ${FATAL} ${ERRORFILE} ${LOGFILE} ${pgmName}
+      return ${FATAL}
+   fi
+
+   return ${OK}
+}
+
+#-------------------------------------------------------------------------
+# Function Name: LOG_MESSAGE
+# Purpose      : Log the  messages to the log file.
+#-------------------------------------------------------------------------
+function LOG_MESSAGE
+{
+   logMsg=`echo $1`       # echo message to a single line
+   logFunc=$2
+   retCode=$3
+
+   dtStamp=`date +"%a %b %e %T"`
+   echo "$dtStamp Program: $pgmName: PID=$pgmPID: $logMsg $logFunc" >> $LOGFILE
+   return $retCode
+}
+#providing permission:
+if [ ! -f "$LOGFILE" ]
+  then
+    touch ${LOGFILE}
+    chmod 666 ${LOGFILE}
+fi #! -f "$LOGFILE"
+
+#-----------------------------------------------
+# Main program starts
+# Parse the command line
+#-----------------------------------------------
+
+# Test for the number of input arguments
+if [ $# -lt 1 ]
+then
+   echo $USAGE
+   exit 1
+fi
+
+CONNECT=$1
+
+LOG_MESSAGE "Started by ${USERID}"
+
+threadVal=1
+
+   sqlTxt="
+    declare
+l_program   errors.message%type := 'int_store_vdate_valid_insertion';
+o_error_message varchar2(2000);
+Cursor c_store_id is
+select trim(store_id) as store_id,trunc(ACTIVE_DATE) as act_date
+ from psm_store_rollout where trunc(ACTIVE_DATE)=trunc(sysdate);
+
+begin
+
+for l_store_id in c_store_id
+loop
+ merge into int_store_vdate isv
+         using (select l_store_id.store_id as store_id
+                     , l_store_id.act_date    as vdate from dual ) din
+              on (isv.store_id = din.store_id)
+          when not matched then
+            insert (store_id, vdate) values (din.store_id, din.vdate);
+end loop;
+
+exception 
+
+  when others then
+      rollback;
+        o_error_message := psm_sql.create_error_message( i_type     => 'exception'
+                                                       , i_program  => l_program
+                                                       , i_db_error => sqlerrm
+                                                       , i_other    => to_char(sqlcode)
+                                                       );
+end ;"
+
+EXEC_SQL ${sqlTxt}
+
+if [[ $? -ne ${OK} ]]; then
+   LOG_ERROR "Thread: $threadVal Failed"
+   return ${FATAL}
+else
+   LOG_MESSAGE "Thread ${threadVal} - Successfully Completed"
+   return ${OK}
+fi
