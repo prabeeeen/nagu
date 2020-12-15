@@ -1,0 +1,98 @@
+#! /bin/ksh
+#-------------------------------------------------------------------------
+# created by :Praveen Kumar
+# Date :  14-Dec-2020
+#  File :  int_store_vdate_valid_update.ksh
+#  usage:  it will insert the record into int_store_vdate table from
+#          psm_store_rollout table if the store will meet the rollout date
+#-------------------------------------------------------------------------
+pgmName=`basename $0`
+pgmName=${pgmName##*/}    # remove the path
+pgmExt=${pgmName##*.}     # get the extension
+pgmName=${pgmName%.*}     # get the program name
+pgmPID=$$                 # get the process ID
+exeDate=`date +"%h_%d"`   # get the execution date
+LOGFILE="${LOGDIR}/$exeDate.log"
+ERRORFILE="${ERROR}/err.$pgmName."$exeDate
+ERRINDFILE=err.ind
+USERID=`whoami`
+
+# Initialize number of parallel threads
+parallelThreads=20
+OK=0
+FATAL=1
+
+USAGE="Usage: `basename $0` <connect> \n"
+
+#-------------------------------------------------------------------------
+# Function Name: LOG_ERROR
+# Purpose      : Log the error messages to the error file.
+#-------------------------------------------------------------------------
+function LOG_ERROR
+{
+   errMsg=`echo $1`       # echo message to a single line
+   errFunc=$2
+   retCode=$3
+
+   dtStamp=`date +"%G%m%d%H%M%S"`
+   echo "$pgmName~$dtStamp~$errFunc~$errMsg" >> $ERRORFILE
+   if [[ $retCode -eq ${FATAL} ]]; then
+      LOG_MESSAGE "Aborted in" $errFunc $retCode
+   fi
+   return $retCode
+}
+
+
+#-------------------------------------------------------------------------
+# Function Name: LOG_MESSAGE
+# Purpose      : Log the  messages to the log file.
+#-------------------------------------------------------------------------
+function LOG_MESSAGE
+{
+   logMsg=`echo $1`       # echo message to a single line
+   logFunc=$2
+   retCode=$3
+
+   dtStamp=`date +"%a %b %e %T"`
+   echo "$dtStamp Program: $pgmName: PID=$pgmPID: $logMsg $logFunc" >> $LOGFILE
+   return $retCode
+}
+#providing permission:
+if [ ! -f "$LOGFILE" ]
+  then
+    touch ${LOGFILE}
+    chmod 666 ${LOGFILE}
+fi #! -f "$LOGFILE"
+
+#-----------------------------------------------
+# Main program starts
+# Parse the command line
+#-----------------------------------------------
+
+# Test for the number of input arguments
+if [ $# -lt 1 ]
+then
+   echo $USAGE
+   exit 1
+fi
+
+CONNECT=$1
+
+LOG_MESSAGE "Started by ${USERID}"
+
+threadVal=1
+
+cnt=`sqlplus -s ${CONNECT} <<EOF
+set pagesize 0 feedback off verify off heading off echo off
+select count(1) from psm_intg.int_store_vdate where trunc(vdate)<>trunc(sysdate);
+EXIT;
+EOF`
+
+
+if [[ $cnt -ne ${OK} ]]; then
+   LOG_ERROR "Thread: $threadVal Failed :Detected stores with errors in batch"
+   return ${FATAL}
+else
+   LOG_MESSAGE "Thread ${threadVal} - Successfully Completed"
+   return ${OK}
+fi
