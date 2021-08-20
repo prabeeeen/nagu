@@ -1,0 +1,389 @@
+#! /bin/ksh
+#-------------------------------------------------------------------------
+#  File :  int_consume_msg.ksh
+#  usage:  int_consume_msg.ksh calls consume for all multi-threaded interfaces
+#-------------------------------------------------------------------------
+pgmName=`basename $0`
+pgmName=${pgmName##*/}    # remove the path
+pgmExt=${pgmName##*.}     # get the extension
+pgmName=${pgmName%.*}     # get the program name
+pgmPID=$$                 # get the process ID
+exeDate=`date +"%h_%d"`   # get the execution date
+LOGFILE="${LOGDIR}/$exeDate.log"
+ERRINDFILE=err.ind
+USERID=`whoami`
+
+# Initialize number of parallel threads variable - default applied during processing
+Slots=0
+CURR_THREADS=1
+
+#initialize Message chunk variable - default applied during processing
+MsgNr=0 
+MsgCnt=0
+MaxMsgSeq=-1
+
+OK=0
+FATAL=255
+
+USAGE="Usage: `basename $0` [-t <# parallel threads>] [-c <#messages to process>] <connect> <family> <sequencing>\n
+      <# parallel threads> is the number of threads to run in parallel.\n
+	  <# messages to process> is the number of messages to process by each thread.\n
+	  <family> Family from where messages are to be processed.\n
+	  <sequencing> Indicates if the family requires sequencing i.e. processed in published/seq order ('Y' or 'N').\n"
+
+#-------------------------------------------------------------------------
+# Function Name: LOG_ERROR
+# Purpose      : Log the error messages to the error file.
+#-------------------------------------------------------------------------
+function LOG_ERROR
+{
+   errMsg=`echo $1`       # echo message to a single line
+   errFunc=$2
+   retCode=$3
+
+   dtStamp=`date +"%G%m%d%H%M%S"`
+   echo "$pgmName~$dtStamp~$errFunc~$errMsg" >> $ERRORFILE
+   if [[ $retCode -eq ${FATAL} ]]; then
+      LOG_MESSAGE "Aborted in" $errFunc $retCode
+   fi
+   return $retCode
+}
+
+#-------------------------------------------------------------------------
+# Function Name: LOG_MESSAGE
+# Purpose      : Log the  messages to the log file.
+#-------------------------------------------------------------------------
+function LOG_MESSAGE
+{
+   logMsg=`echo $1`       # echo message to a single line
+   logFunc=$2
+   retCode=$3
+
+   dtStamp=`date +"%a %b %e %T"`
+   echo "$dtStamp Program: ${pgmName}_${Family}: PID=$pgmPID: $logMsg $logFunc" >> $LOGFILE
+   return $retCode
+}
+
+#-------------------------------------------------------------------------
+# Function Name: EXEC_SQL
+# Purpose      : Used for executing the sql statements.
+#-------------------------------------------------------------------------
+function EXEC_SQL
+{
+   sqlTxt=$*
+
+   sqlReturn=`echo "set feedback off;
+      set heading off;
+      set term off;
+      set verify off;
+      set serveroutput on size 1000000;
+
+      VARIABLE GV_return_code    NUMBER;
+      VARIABLE GV_script_error   CHAR(255);
+
+      EXEC :GV_return_code  := 0;
+      EXEC :GV_script_error := NULL;
+
+      WHENEVER SQLERROR EXIT ${FATAL}
+      $sqlTxt
+      /
+ 
+      print :GV_script_error;
+      exit  :GV_return_code;
+      " | sqlplus -s ${CONNECT}`
+    
+   if [[ $? -ne ${OK} ]]; then
+      LOG_ERROR "${sqlReturn}" "EXEC_SQL" ${FATAL} ${ERRORFILE} ${LOGFILE} ${pgmName}
+      return ${FATAL}
+   fi
+   
+   return ${OK}
+}
+
+#-------------------------------------------------------------------------
+# Function Name: GET_THREADS
+# Purpose      : Getting total thread count
+#-------------------------------------------------------------------------
+function GET_THREADS
+{
+   Slots=`$ORACLE_HOME/bin/sqlplus -s $CONNECT <<EOF
+set pause off
+set pagesize 0
+set feedback off
+set verify off
+set heading off
+set echo off
+
+select value
+from psm_intg.int_configuration
+where key = 'THREAD_COUNT'
+and key_detail = UPPER('CONSUME_$Family'); 
+exit;
+EOF`
+
+ if [ -z "$Slots" ]
+   then
+      Slots=1
+   fi
+   
+ return ${OK}
+}
+
+#-------------------------------------------------------------------------
+# Function Name: GET_MSG_CHUNK
+# Purpose      : Getting total Message Number to be processed by thread
+#-------------------------------------------------------------------------
+function GET_MSG_CHUNK
+{
+    MsgNr=`$ORACLE_HOME/bin/sqlplus -s $CONNECT <<EOF
+set pause off
+set pagesize 0
+set feedback off
+set verify off
+set heading off
+set echo off
+
+select value
+from psm_intg.int_configuration
+where key = 'MESSAGE_CHUNK_VALUE'
+and key_detail = UPPER('CONSUME_$Family'); 
+exit;
+EOF`
+
+   if [ -z "$MsgNr" ]
+   then
+      MsgNr=1
+   fi
+   
+ return ${OK}
+}
+
+#-------------------------------------------------------------------------
+# Function Name: GET_MSG2PROCESS
+# Purpose      : Get current number of messages to process
+#-------------------------------------------------------------------------
+function GET_MSG2PROCESS
+{
+    ReturnSql=`$ORACLE_HOME/bin/sqlplus -s $CONNECT <<EOF
+set pause off
+set pagesize 0
+set feedback off
+set verify off
+set heading off
+set echo off
+
+select count(1)||';'||nvl(max(q_seq_no),0)
+  from psm_intg.int_msg_q
+ where family = '$Family'
+   and status = 'N'
+   and (q_seq_no <= $MaxMsgSeq or $MaxMsgSeq = -1); 
+exit;
+EOF`
+
+MsgCnt=`echo $ReturnSql | cut -d ";" -f 1 ` 
+MaxMsgSeq=`echo $ReturnSql | cut -d ";" -f 2 `
+}
+
+#-------------------------------------------------------------------------
+# Function Name: GET_PARTITION_INFO
+# Purpose      : Get partition information for multi-threading distribution
+#-------------------------------------------------------------------------
+function GET_PARTITION_INFO
+{
+    PartitionCnt=`$ORACLE_HOME/bin/sqlplus -s $CONNECT <<EOF
+set pause off
+set pagesize 0
+set feedback off
+set verify off
+set heading off
+set echo off
+
+select apt.partition_count - 1 
+  from all_part_tables apt,
+	   psm_intg.int_configuration ic,
+	   psm_intg.int_configuration ic1
+ where apt.owner       = ic1.value
+   and ic.key          = 'PARTITION_TABLE'
+   and ic.value        = '$Family'
+   and apt.table_name  = ic.value2
+   and ic1.key         = 'PSM'
+   and ic1.key_detail  = 'TABLE_OWNER'; 
+exit;
+EOF`
+
+  if [ -z "$PartitionCnt" ]
+  then
+     PartitionCnt=1
+  fi
+
+}
+
+
+#-------------------------------------------------------------------------
+# Function Name: PROCESS_CONSUME
+# Purpose      :
+#-------------------------------------------------------------------------
+function PROCESS_CONSUME
+{
+  Threadval=$1
+
+  SqlTxt="BEGIN DBMS_APPLICATION_INFO.SET_MODULE('${pgmName}.${Family}', NULL); intg_consume_msg_multithread('${Family}',$Slots,$Threadval,$MsgNr,$PartitionCnt,'$SeqReq'); END;"
+		  
+  EXEC_SQL ${SqlTxt}
+  
+  if [ $? -eq ${FATAL} ]
+  then
+    #return ${FATAL}
+	exit ${FATAL}
+  fi
+  
+  return ${OK}
+}
+
+#-------------------------------------------------------------------------
+# Function Name: SET_APPLICATION_INFO
+# Purpose      :
+#-------------------------------------------------------------------------
+#function SET_APPLICATION_INFO
+#{
+#  SqlTxt="BEGIN DBMS_APPLICATION_INFO.SET_MODULE('${pgmName}.${Family}', NULL); END;"
+#  
+#  EXEC_SQL ${SqlTxt}
+#  
+#  return ${OK}
+#}
+
+
+#-----------------------------------------------
+# Main program starts 
+# Parse the command line
+#-----------------------------------------------
+
+# Validate options passed-in.  Only -p is valid
+while getopts ":t:c:" CMD; do
+    case "${CMD}" in
+        t)
+            Slots=${OPTARG};;
+        c)
+            MsgNr=${OPTARG};;
+        *)
+            echo $0: Unknown option $OPTARG
+            echo $USAGE
+            exit 1;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+# Test for the number of input arguments
+if [ $# -lt 3 ]
+then
+   echo $USAGE
+   exit 1
+fi
+
+CONNECT=$1
+Family=$2
+SeqReq=$3
+
+if [ $Slots -eq 0 ] || [ $Slots -lt 1 ]
+then
+   GET_THREADS
+fi
+
+if [ $MsgNr -eq 0 ] || [ $MsgNr -lt 1 ]
+then
+   GET_MSG_CHUNK
+fi
+
+ERRORFILE="${ERROR}/err.${pgmName}_${Family}."$exeDate_$pgmPID
+touch $ERRORFILE
+
+# If this script is killed, cleanup
+trap "kill -15 0; rm -f $ERRORFILE ; exit 15" 1 2 3 15
+
+#giving permissions
+if [ ! -f "$LOGFILE" ]
+then
+   touch ${LOGFILE}
+   chmod 666 ${LOGFILE}
+fi #! -f "$LOGFILE"
+
+LOG_MESSAGE "Started by ${USERID}"
+
+#Get total massages to process on this Run
+GET_MSG2PROCESS
+
+if [ $MaxMsgSeq -eq 0 ]
+then
+  LOG_MESSAGE "No message to process in $Family interface. Program:${pgmName}_${Family} - PID:$pgmPID"
+  if [ `grep "ORA-" $ERRORFILE | wc -l` -eq 0 ]
+  then
+    rm -f $ERRORFILE
+  fi
+  exit ${OK}
+fi
+
+#export Res_File="/retail/psmbatch/tmp/int_pack_exe_SALES_IN.res"
+sh -x ${SRC}/int_generic_on_off.ksh $CONNECT "${Family}"
+
+intFamilyOnOFF=$?
+echo $intFamilyOnOFF
+ 
+if [ $intFamilyOnOFF -eq 255 ]
+then
+   LOG_ERROR "Execution failed - CONNECTION TO DB FAILED"
+   exit ${FATAL};
+fi
+
+if [ $intFamilyOnOFF -eq 0 ]
+then
+   LOG_MESSAGE "$Family Generic ON"
+   LOG_MESSAGE "Running sales with $Slots threads and processing $MsgNr Messages per thread. Program:${pgmName}_${Family} - PID $pgmPID"
+   
+   #CURR_THREADS=`ps -ef | grep ${Family} | wc -l`
+   #CURR_THREADS=`expr $CURR_THREADS - 2 `
+   
+   #SET_APPLICATION_INFO
+   GET_PARTITION_INFO
+   
+   while [ $MsgCnt -gt 0 ]
+   do
+      #Calls to the function based on the thread count    
+      while [ $CURR_THREADS -le $Slots ]
+      do
+         PROCESS_CONSUME $CURR_THREADS & 
+         CURR_THREADS=`expr $CURR_THREADS + 1 `
+         MsgCnt=`expr $MsgCnt - $MsgNr `		 
+      done
+
+      #while [ $CURR_THREADS -ge $Slots ]
+      #do
+      #  CURR_THREADS=`ps -ef | grep ${Family} | wc -l`
+      #  CURR_THREADS=`expr $CURR_THREADS - 2 `
+      #done
+      wait
+	    
+	  if [ MsgCnt -le 0 ]
+	  then
+	    GET_MSG2PROCESS 
+	  fi
+	  
+      CURR_THREADS=1
+   done
+else
+   LOG_MESSAGE "$Family Generic OFF"
+fi
+   
+# Check for any Oracle errors from the SQLPLUS process
+if [ `grep "ORA-" $ERRORFILE | wc -l` -gt 0 ]
+then
+   echo "Exiting due to ORA Error. Check error file"  >> $LOGFILE
+   exit 1
+else
+   rm -f $ERRORFILE
+fi
+
+LOG_MESSAGE "Successfully executed sales with $Slots threads and processing $MsgNr Messages per thread. Program:${pgmName}_${Family} - PID $pgmPID"
+
+exit ${OK}
